@@ -1,0 +1,3 @@
+[
+    {"id": "M1", "stops": ["3", "F2", "5", "2"], "frequency": 5, "capacity": 200, "speed": 60}
+] 
