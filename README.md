@@ -2,8 +2,6 @@
 Flask app for Cairo's traffic &amp; transit management using NetworkX. Models city graph, simulates traffic, optimizes emergency &amp; transit routes with A* pathfinding. Visualizes with Folium/Matplotlib, offers dashboard for analysis, node/edge edits, and result downloads to enhance urban mobility.
 # Cairo Traffic and Transit Management System
 
-# Cairo Traffic and Transit Management System
-
 ## Description
 Flask app for Cairo's traffic & transit management using NetworkX. Models city graph, simulates traffic, optimizes emergency & transit routes with A* pathfinding. Visualizes with Folium/Matplotlib, offers dashboard for analysis, node/edge edits, and result downloads to enhance urban mobility.
 
