@@ -1,0 +1,635 @@
+import networkx as nx
+from networkx.readwrite import json_graph
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import folium
+import os
+import json
+import numpy as np
+from flask import Flask, render_template, request, send_from_directory, redirect, url_for, send_file
+from datetime import datetime, timedelta
+import heapq
+import math
+
+# Import project modules
+from emergency.astar_emergency import astar_emergency
+from emergency.emergency_simulation import EmergencySimulation
+from emergency.response_analysis import analyze_responses
+from transit.transit_optimization import TransitOptimizer, calculate_travel_time
+from transit.visualize_transit import visualize_transit
+from transit.improvement_analysis import analyze_improvements
+
+app = Flask(__name__)
+
+# Directories
+DATA_DIR = 'data'
+STATIC_DIR = 'static'
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+# JSON file paths
+GRAPH_FILE = os.path.join(DATA_DIR, 'graph.json')
+TRAFFIC_FILE = os.path.join(DATA_DIR, 'traffic_flow.json')
+EMERGENCY_FILE = os.path.join(DATA_DIR, 'emergency_results.json')
+TRANSIT_FILE = os.path.join(DATA_DIR, 'transit_results.json')
+ROUTE_FILE = os.path.join(DATA_DIR, 'route_output.json')
+CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
+
+# Initialize graph
+def initialize_graph():
+    G = nx.Graph()
+    neighborhoods = [
+        ("Shubra", 31.2409, 30.0781, 1000000, False, "neighborhood"),
+        ("Cairo International Airport", 31.4055, 30.1219, 5000, False, "neighborhood"),
+        ("Heliopolis", 31.3260, 30.0988, 500000, False, "neighborhood"),
+        ("Al Rehab", 31.4685, 30.0700, 200000, False, "neighborhood"),
+        ("New Administrative Capital", 31.7667, 30.0167, 100000, False, "neighborhood"),
+        ("Downtown Cairo", 31.2357, 30.0444, 500000, False, "neighborhood"),
+        ("Cairo Festival City", 31.4195, 30.0289, 50000, False, "neighborhood"),
+        ("New Cairo", 31.4635, 30.0297, 300000, False, "neighborhood"),
+        ("Giza", 31.2083, 30.0131, 4000000, False, "neighborhood"),
+        ("Maadi", 31.2599, 29.9592, 100000, False, "neighborhood"),
+        ("Maadi Military Hospital", 31.2620, 29.9500, 0, True, "neighborhood"),
+        ("Sheikh Zayed", 30.9555, 30.0400, 150000, False, "neighborhood"),
+        ("Smart Village", 30.9875, 30.0725, 20000, False, "neighborhood"),
+        ("6th October City", 30.9128, 29.9381, 500000, False, "neighborhood"),
+        ("Helwan", 31.3318, 29.8414, 700000, False, "neighborhood"),
+    ]
+    transit_stops = [
+        ("McGill University", 31.2167, 30.0167, 0, True, "transit_stop"),
+        ("Cairo International Stadium", 31.2975, 30.0700, 0, True, "transit_stop"),
+        ("Roxy Metro Station", 31.3167, 30.1017, 0, True, "transit_stop"),
+    ]
+    for node in neighborhoods + transit_stops:
+        G.add_node(node[0], x=node[1], y=node[2], population=node[3], is_critical=node[4], type=node[5])
+    edges = [
+        ("Shubra", "Smart Village"), ("Shubra", "Heliopolis"),
+        ("Cairo International Airport", "Heliopolis"), ("Cairo International Airport", "Al Rehab"),
+        ("Heliopolis", "Roxy Metro Station"), ("Heliopolis", "Cairo International Stadium"),
+        ("Al Rehab", "New Administrative Capital"), ("Al Rehab", "Cairo International Stadium"),
+        ("New Administrative Capital", "New Cairo"),
+        ("Downtown Cairo", "Cairo Festival City"), ("Downtown Cairo", "Giza"), ("Downtown Cairo", "McGill University"),
+        ("Cairo Festival City", "New Cairo"), ("Cairo Festival City", "Maadi"),
+        ("New Cairo", "Maadi"), ("New Cairo", "Cairo International Stadium"),
+        ("Giza", "Sheikh Zayed"), ("Giza", "McGill University"), ("Giza", "Maadi"),
+        ("Maadi", "Maadi Military Hospital"), ("Maadi", "Helwan"),
+        ("Maadi Military Hospital", "Helwan"),
+        ("Sheikh Zayed", "Smart Village"), ("Sheikh Zayed", "6th October City"),
+        ("Smart Village", "6th October City"),
+        ("6th October City", "Helwan"),
+        ("Cairo International Stadium", "Roxy Metro Station"),
+        ("McGill University", "Maadi Military Hospital")
+    ]
+    for u, v in edges:
+        G.add_edge(u, v, capacity=1000, has_traffic_signal=False, traffic_flow=0)
+    return G
+
+# JSON file handling
+def save_graph(graph, filename=GRAPH_FILE):
+    data = json_graph.node_link_data(graph)
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def load_graph(filename=GRAPH_FILE):
+    if not os.path.exists(filename):
+        graph = initialize_graph()
+        save_graph(graph, filename)
+        return graph
+    with open(filename, 'r') as f:
+        data = json.load(f)
+    return json_graph.node_link_graph(data)
+
+def save_json(data, filename):
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def load_json(filename, default=None):
+    if not os.path.exists(filename):
+        if default is not None:
+            save_json(default, filename)
+        return default
+    with open(filename, 'r') as f:
+        return json.load(f)
+
+# Initialize JSON files
+graph = load_graph()
+traffic_flow = load_json(TRAFFIC_FILE, {})
+traffic_data = load_json(TRAFFIC_FILE, [])
+emergency_results = load_json(EMERGENCY_FILE, None)
+transit_results = load_json(TRANSIT_FILE, None)
+route_output = load_json(ROUTE_FILE, None)
+config = load_json(CONFIG_FILE, {
+    'traffic_date': '2025-04-25', 'traffic_time': '08:00',
+    'route_date': '2025-04-25', 'route_time': '08:00',
+    'emergency_num_vehicles': 2, 'emergency_num_incidents': 2,
+    'emergency_preemption_factor': 0.5, 'emergency_simulation_steps': 60,
+    'emergency_start_date': '2025-04-25', 'emergency_start_time': '08:00',
+    'transit_num_trips': 2, 'transit_total_vehicles': 4, 'transit_trip_interval': 15,
+    'transit_start_date': '2025-04-25', 'transit_start_time': '06:00', 'transit_num_routes': 2
+})
+
+# Helper functions
+def simulate_traffic_flow(graph, current_time):
+    hour = current_time.hour
+    is_rush_hour = (7 <= hour <= 9) or (16 <= hour <= 18)
+    traffic_flow = {}
+    for u, v, data in graph.edges(data=True):
+        capacity = data.get('capacity', 1000)
+        base_flow = capacity * 0.5
+        if is_rush_hour:
+            base_flow *= 1.5
+        if data.get('has_traffic_signal', False):
+            base_flow *= 0.8
+        traffic_flow[(u, v)] = min(base_flow, capacity)
+        traffic_flow[(v, u)] = min(base_flow, capacity)
+        graph.edges[u, v]['traffic_flow'] = traffic_flow[(u, v)]
+    return traffic_flow
+
+def create_traffic_flow_map(graph):
+    m = folium.Map(location=[30.0444, 31.2357], zoom_start=11)
+    for node, data in graph.nodes(data=True):
+        node_type = data.get('type', 'neighborhood')
+        color = 'blue' if node_type == 'neighborhood' else 'orange'
+        folium.Marker(
+            location=[data['y'], data['x']],
+            popup=f"{node}<br>Type: {node_type}<br>Population: {data['population']}<br>Critical: {data['is_critical']}",
+            icon=folium.Icon(color=color)
+        ).add_to(m)
+    for u, v, data in graph.edges(data=True):
+        u_data = graph.nodes[u]
+        v_data = graph.nodes[v]
+        traffic_flow = data.get('traffic_flow', 0)
+        capacity = data.get('capacity', 1000)
+        color = 'green' if traffic_flow < capacity * 0.5 else 'orange' if traffic_flow < capacity * 0.8 else 'red'
+        folium.PolyLine(
+            locations=[[u_data['y'], u_data['x']], [v_data['y'], v_data['x']]],
+            color=color,
+            weight=5,
+            popup=f"Traffic Flow: {traffic_flow}/{capacity}"
+        ).add_to(m)
+    map_path = os.path.join(STATIC_DIR, 'traffic_map.html')
+    m.save(map_path)
+    return 'traffic_map.html'
+
+def create_route_map(graph, path):
+    if not path:
+        return None
+    m = folium.Map(location=[30.0444, 31.2357], zoom_start=11)
+    for node, data in graph.nodes(data=True):
+        node_type = data.get('type', 'neighborhood')
+        color = 'blue' if node_type == 'neighborhood' else 'orange'
+        folium.Marker(
+            location=[data['y'], data['x']],
+            popup=f"{node}<br>Type: {node_type}<br>Population: {data['population']}<br>Critical: {data['is_critical']}",
+            icon=folium.Icon(color=color)
+        ).add_to(m)
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i + 1]
+        u_data = graph.nodes[u]
+        v_data = graph.nodes[v]
+        folium.PolyLine(
+            locations=[[u_data['y'], u_data['x']], [v_data['y'], v_data['x']],
+            color='blue',
+            weight=5,
+            popup=f"Segment: {u} to {v}"
+        ).add_to(m)
+    map_path = os.path.join(STATIC_DIR, 'route_map.html')
+    m.save(map_path)
+    return 'route_map.html'
+
+def visualize_network(graph, path=None, filename="network.png"):
+    plt.figure(figsize=(10, 8))
+    pos = {node: (data['x'], data['y']) for node, data in graph.nodes(data=True)}
+    node_colors = ['blue' if data['type'] == 'neighborhood' else 'orange' for node, data in graph.nodes(data=True)]
+    nx.draw(graph, pos, with_labels=True, node_color=node_colors, node_size=500, font_size=10)
+    if path:
+        path_edges = list(zip(path[:-1], path[1:]))
+        nx.draw_networkx_edges(graph, pos, edgelist=path_edges, edge_color='red', width=2)
+    plt.savefig(os.path.join(STATIC_DIR, filename))
+    plt.close()
+
+# A* algorithm (from original)
+def a_star(graph, start, end, time_index=3):
+    def heuristic(node1, node2):
+        x1, y1 = graph.nodes[node1]['x'], graph.nodes[node1]['y']
+        x2, y2 = graph.nodes[node2]['x'], graph.nodes[node2]['y']
+        return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+
+    open_set = [(0, start)]
+    g_score = {node: float('inf') for node in graph.nodes()}
+    g_score[start] = 0
+    f_score = {node: float('inf') for node in graph.nodes()}
+    f_score[start] = heuristic(start, end)
+    predecessors = {node: None for node in graph.nodes()}
+
+    while open_set:
+        current_f, current = heapq.heappop(open_set)
+        if current == end:
+            break
+
+        for neighbor, data in graph[current].items():
+            traffic = data.get('traffic_flow', 1000)
+            traffic_factor = 1 + (traffic / 4000)
+            distance = math.sqrt((graph.nodes[neighbor]['x'] - graph.nodes[current]['x']) ** 2 +
+                                 (graph.nodes[neighbor]['y'] - graph.nodes[current]['y']) ** 2)
+            tentative_g = g_score[current] + (distance * traffic_factor)
+
+            if tentative_g < g_score[neighbor]:
+                predecessors[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = g_score[neighbor] + heuristic(neighbor, end)
+                heapq.heappush(open_set, (f_score[neighbor], neighbor))
+
+    path = []
+    current = end
+    while current is not None:
+        path.append(current)
+        current = predecessors[current]
+    path.reverse()
+
+    total_distance = sum(math.sqrt((graph.nodes[path[i+1]]['x'] - graph.nodes[path[i]]['x']) ** 2 +
+                                   (graph.nodes[path[i+1]]['y'] - graph.nodes[path[i]]['y']) ** 2)
+                         for i in range(len(path) - 1))
+    traffic_avg = np.mean([graph[path[i]][path[i+1]].get('traffic_flow', 1000) for i in range(len(path) - 1)])
+    speed = 60 / (1 + traffic_avg / 2000)
+    travel_time = (total_distance / speed) * 60
+    return path, travel_time
+
+# Routes
+@app.route('/')
+def splash():
+    return render_template('splash.html')
+
+@app.route('/main', methods=['GET', 'POST'])
+def main():
+    global graph, traffic_flow, traffic_data, emergency_results, transit_results, route_output, config
+    app_mode = request.form.get('app_mode', 'Summary Dashboard')
+    nodes = [(node, node) for node in graph.nodes()]
+
+    if app_mode == "Summary Dashboard":
+        visualize_network(graph, filename="network.png")
+        traffic_df = pd.DataFrame(traffic_data) if traffic_data else None
+        emergency_summary = None
+        if emergency_results:
+            analysis, responses = emergency_results['analysis'], emergency_results['responses']
+            emergency_summary = {
+                'success_rate': analysis['success_rate_percent'],
+                'avg_response_time': analysis['average_response_time_minutes'],
+                'max_response_time': analysis['max_response_time_minutes'],
+                'min_response_time': analysis['min_response_time_minutes']
+            }
+            response_times = [r['response_time'] for r in responses]
+            if response_times:
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.hist(response_times, bins=14, edgecolor='black')
+                ax.set_title('Emergency Response Times')
+                ax.set_xlabel('Response Time (min)')
+                ax.set_ylabel('Frequency')
+                plt.savefig(os.path.join(STATIC_DIR, 'emergency_histogram.png'))
+                plt.close()
+
+        transit_summary = None
+        transit_schedule_df = None
+        transit_travel_times_df = None
+        if transit_results:
+            schedule, allocation, transit_analysis, routes, travel_times = (
+                transit_results['schedule'], transit_results['allocation'],
+                transit_results['analysis'], transit_results['routes'], transit_results['travel_times']
+            )
+            transit_summary = {
+                'baseline_avg_time': transit_analysis['baseline_average_travel_time_minutes'],
+                'optimized_avg_time': transit_analysis['optimized_average_travel_time_minutes'],
+                'time_improvement': transit_analysis['time_improvement_percent'],
+                'transfer_efficiency': transit_analysis['transfer_efficiency_percent']
+            }
+            transit_schedule_df = pd.DataFrame(
+                [(r, t) for r, t in schedule],
+                columns=["Route Index", "Time"]
+            ).to_dict('records')
+            transit_travel_times_df = pd.DataFrame(travel_times).to_dict('records')
+
+        m = folium.Map(location=[30.0444, 31.2357], zoom_start=11)
+        for node, data in graph.nodes(data=True):
+            color = 'blue' if data['type'] == 'neighborhood' else 'orange'
+            folium.Marker(
+                location=[data['y'], data['x']],
+                popup=f"{node}<br>Type: {data['type']}<br>Population: {data['population']}<br>Critical: {data['is_critical']}",
+                icon=folium.Icon(color=color)
+            ).add_to(m)
+        for u, v, data in graph.edges(data=True):
+            u_data = graph.nodes[u]
+            v_data = graph.nodes[v]
+            traffic_flow_val = data.get('traffic_flow', 0)
+            capacity = data.get('capacity', 1000)
+            color = 'green' if traffic_flow_val < capacity * 0.5 else 'orange' if traffic_flow_val < capacity * 0.8 else 'red'
+            folium.PolyLine(
+                locations=[[u_data['y'], u_data['x']], [v_data['y'], v_data['x']]],
+                color=color,
+                weight=5,
+                popup=f"Traffic Flow: {traffic_flow_val}/{capacity}"
+            ).add_to(m)
+        m.save(os.path.join(STATIC_DIR, 'network_map.html'))
+
+        return render_template('main.html', app_mode=app_mode, nodes=nodes, graph=graph,
+                               traffic_df=traffic_df, emergency_summary=emergency_summary,
+                               transit_summary=transit_summary, transit_schedule_df=transit_schedule_df,
+                               transit_travel_times_df=transit_travel_times_df, map_file='network_map.html',
+                               config=config)
+
+    elif app_mode == "Infrastructure Network Design":
+        error = None
+        success = None
+        if request.method == 'POST':
+            action = request.form.get('action')
+            if action == 'add_node':
+                node_name = request.form.get('node_name')
+                node_x = float(request.form.get('node_x', 31.2))
+                node_y = float(request.form.get('node_y', 30.0))
+                node_population = int(request.form.get('node_population', 0))
+                node_is_critical = request.form.get('node_is_critical') == 'on'
+                node_type = request.form.get('node_type', 'neighborhood')
+                if node_name and node_name not in graph.nodes:
+                    graph.add_node(node_name, x=node_x, y=node_y, population=node_population,
+                                   is_critical=node_is_critical, type=node_type)
+                    save_graph(graph)
+                    success = f"Node '{node_name}' added successfully!"
+                else:
+                    error = f"Node '{node_name}' already exists or invalid!"
+            elif action == 'add_edge':
+                node1 = request.form.get('node1')
+                node2 = request.form.get('node2')
+                capacity = int(request.form.get('capacity', 1000))
+                has_traffic_signal = request.form.get('has_traffic_signal') == 'on'
+                if node1 != node2 and not graph.has_edge(node1, node2):
+                    graph.add_edge(node1, node2, capacity=capacity, has_traffic_signal=has_traffic_signal, traffic_flow=0)
+                    save_graph(graph)
+                    success = f"Edge between '{node1}' and '{node2}' added successfully!"
+                else:
+                    error = f"Invalid edge or already exists!"
+            elif action == 'remove_node':
+                node = request.form.get('node_to_remove')
+                if node in graph.nodes:
+                    graph.remove_node(node)
+                    save_graph(graph)
+                    success = f"Node '{node}' removed successfully!"
+                else:
+                    error = f"Node '{node}' not found!"
+            elif action == 'remove_edge':
+                edge = request.form.get('edge_to_remove')
+                if edge:
+                    u, v = edge.split(' - ')
+                    if graph.has_edge(u, v):
+                        graph.remove_edge(u, v)
+                        save_graph(graph)
+                        success = f"Edge between '{u}' and '{v}' removed successfully!"
+                    else:
+                        error = f"Edge not found!"
+
+        m = folium.Map(location=[30.0444, 31.2357], zoom_start=11)
+        for node, data in graph.nodes(data=True):
+            color = 'blue' if data['type'] == 'neighborhood' else 'orange'
+            folium.Marker(
+                location=[data['y'], data['x']],
+                popup=f"{node}<br>Type: {data['type']}<br>Population: {data['population']}<br>Critical: {data['is_critical']}",
+                icon=folium.Icon(color=color)
+            ).add_to(m)
+        for u, v, data in graph.edges(data=True):
+            u_data = graph.nodes[u]
+            v_data = graph.nodes[v]
+            folium.PolyLine(
+                locations=[[u_data['y'], u_data['x']], [v_data['y'], v_data['x']],
+                color='black',
+                weight=5,
+                popup=f"Capacity: {data['capacity']}<br>Traffic Signal: {data['has_traffic_signal']}"
+            ).add_to(m)
+        m.save(os.path.join(STATIC_DIR, 'network_map.html'))
+
+        return render_template('main.html', app_mode=app_mode, nodes=nodes, graph=graph,
+                               error=error, success=success, map_file='network_map.html', config=config)
+
+    elif app_mode == "Traffic Flow Simulation":
+        traffic_df = None
+        map_file = None
+        if request.method == 'POST':
+            traffic_date = request.form.get('traffic_date', config['traffic_date'])
+            traffic_time = request.form.get('traffic_time', config['traffic_time'])
+            config['traffic_date'] = traffic_date
+            config['traffic_time'] = traffic_time
+            save_json(config, CONFIG_FILE)
+            traffic_datetime = datetime.strptime(f"{traffic_date} {traffic_time}", '%Y-%m-%d %H:%M')
+            traffic_flow = simulate_traffic_flow(graph, traffic_datetime)
+            traffic_data = [
+                {"Edge": f"{u} - {v}", "Traffic Flow": flow, "Capacity": graph.edges[u, v]['capacity']}
+                for (u, v), flow in traffic_flow.items() if u < v
+            ]
+            save_json(traffic_flow, TRAFFIC_FILE)
+            save_json(traffic_data, TRAFFIC_FILE.replace('traffic_flow', 'traffic_data'))
+            save_graph(graph)
+            traffic_df = pd.DataFrame(traffic_data).to_dict('records')
+            map_file = create_traffic_flow_map(graph)
+
+        return render_template('main.html', app_mode=app_mode, nodes=nodes, traffic_df=traffic_df,
+                               map_file=map_file, config=config)
+
+    elif app_mode == "Routing Recommendations":
+        route_output_local = route_output
+        map_file = None
+        if request.method == 'POST':
+            route_type = request.form.get('route_type')
+            start_node = request.form.get('start_node')
+            end_node = request.form.get('end_node')
+            route_date = request.form.get('route_date', config['route_date'])
+            route_time = request.form.get('route_time', config['route_time'])
+            config['route_date'] = route_date
+            config['route_time'] = route_time
+            save_json(config, CONFIG_FILE)
+            route_datetime = datetime.strptime(f"{route_date} {route_time}", '%Y-%m-%d %H:%M')
+            route_output_local = []
+            path = None
+            if start_node == end_node:
+                route_output_local.append("**Error:** Start and end nodes must be different!")
+            else:
+                if route_type == "Emergency Vehicle":
+                    path, travel_time = a_star(graph, start_node, end_node)
+                    if path:
+                        route_output_local.append(f"**Emergency Vehicle Route**")
+                        route_output_local.append(f"**Path:** {' -> '.join(path)}")
+                        route_output_local.append(f"**Travel Time:** {round(travel_time, 2)} minutes (without preemption)")
+                        route_output_local.append(f"**Travel Time with Preemption (0.5 factor):** {round(travel_time * 0.5, 2)} minutes")
+                    else:
+                        route_output_local.append("**Error:** No path found!")
+                elif route_type == "Transit Route":
+                    try:
+                        path = nx.shortest_path(graph, start_node, end_node)
+                        travel_time = sum(
+                            calculate_travel_time(graph, path[i], path[i + 1], route_datetime)
+                            for i in range(len(path) - 1))
+                        route_output_local.append(f"**Transit Route**")
+                        route_output_local.append(f"**Path:** {' -> '.join(path)}")
+                        route_output_local.append(f"**Travel Time:** {round(travel_time, 2)} minutes")
+                    except nx.NetworkXNoPath:
+                        route_output_local.append("**Error:** No path found!")
+            route_output = route_output_local
+            save_json(route_output, ROUTE_FILE)
+            map_file = create_route_map(graph, path)
+
+        return render_template('main.html', app_mode=app_mode, nodes=nodes, route_output=route_output_local,
+                               map_file=map_file, config=config)
+
+    elif app_mode == "Emergency Simulation":
+        emergency_summary = None
+        incidents_df = None
+        responses_df = None
+        error = None
+        if request.method == 'POST':
+            num_vehicles = int(request.form.get('num_vehicles', config['emergency_num_vehicles']))
+            num_incidents = int(request.form.get('num_incidents', config['emergency_num_incidents']))
+            preemption_factor = float(request.form.get('preemption_factor', config['emergency_preemption_factor']))
+            simulation_steps = int(request.form.get('simulation_steps', config['emergency_simulation_steps']))
+            start_date = request.form.get('start_date', config['emergency_start_date'])
+            start_time = request.form.get('start_time', config['emergency_start_time'])
+            config.update({
+                'emergency_num_vehicles': num_vehicles, 'emergency_num_incidents': num_incidents,
+                'emergency_preemption_factor': preemption_factor, 'emergency_simulation_steps': simulation_steps,
+                'emergency_start_date': start_date, 'emergency_start_time': start_time
+            })
+            save_json(config, CONFIG_FILE)
+            start_datetime = datetime.strptime(f"{start_date} {start_time}", '%Y-%m-%d %H:%M')
+            emergency_locations = [node for node, data in graph.nodes(data=True) if data.get('is_critical', False)]
+            if len(emergency_locations) < num_vehicles:
+                error = "Not enough critical nodes for the number of vehicles!"
+            else:
+                sim = EmergencySimulation(graph, num_vehicles, emergency_locations, preemption_factor)
+                sim.generate_incidents(start_datetime, num_incidents=num_incidents)
+                responses = sim.simulate(start_datetime, steps=simulation_steps)
+                analysis = analyze_responses(responses, sim.incidents, output_dir=STATIC_DIR)
+                emergency_results = {'analysis': analysis, 'responses': responses}
+                save_json(emergency_results, EMERGENCY_FILE)
+                emergency_summary = {
+                    'success_rate': analysis['success_rate_percent'],
+                    'avg_response_time': analysis['average_response_time_minutes'],
+                    'max_response_time': analysis['max_response_time_minutes'],
+                    'min_response_time': analysis['min_response_time_minutes']
+                }
+                incidents_df = pd.DataFrame([
+                    {"Node": inc['node'], "Time": inc['time'].strftime('%Y-%m-%d %H:%M')}
+                    for inc in sim.incidents
+                ]).to_dict('records')
+                responses_df = pd.DataFrame([
+                    {
+                        "Vehicle ID": r['vehicle'],
+                        "Incident Node": r['incident_node'],
+                        "Start Time": r['start_time'].strftime('%Y-%m-%d %H:%M'),
+                        "Response Time (min)": round(r['response_time'], 2)
+                    }
+                    for r in responses
+                ]).to_dict('records')
+                response_times = [r['response_time'] for r in responses]
+                if response_times:
+                    fig, ax = plt.subplots(figsize=(6, 4))
+                    ax.hist(response_times, bins=14, edgecolor='black')
+                    ax.set_title('Emergency Response Times')
+                    ax.set_xlabel('Response Time (min)')
+                    ax.set_ylabel('Frequency')
+                    plt.savefig(os.path.join(STATIC_DIR, 'emergency_histogram.png'))
+                    plt.close()
+
+        return render_template('main.html', app_mode=app_mode, nodes=nodes, emergency_summary=emergency_summary,
+                               incidents_df=incidents_df, responses_df=responses_df, error=error, config=config)
+
+    elif app_mode == "Transit Optimization":
+        transit_summary = None
+        allocation_df = None
+        schedule_df = None
+        travel_times_df = None
+        map_file = None
+        error = None
+        if request.method == 'POST':
+            num_trips = int(request.form.get('num_trips', config['transit_num_trips']))
+            total_vehicles = int(request.form.get('total_vehicles', config['transit_total_vehicles']))
+            trip_interval = int(request.form.get('trip_interval', config['transit_trip_interval']))
+            transit_date = request.form.get('transit_date', config['transit_start_date'])
+            transit_time = request.form.get('transit_time', config['transit_start_time'])
+            num_routes = int(request.form.get('num_routes', config['transit_num_routes']))
+            config.update({
+                'transit_num_trips': num_trips, 'transit_total_vehicles': total_vehicles,
+                'transit_trip_interval': trip_interval, 'transit_start_date': transit_date,
+                'transit_start_time': transit_time, 'transit_num_routes': num_routes
+            })
+            save_json(config, CONFIG_FILE)
+            transit_datetime = datetime.strptime(f"{transit_date} {transit_time}", '%Y-%m-%d %H:%M')
+            routes = []
+            for i in range(num_routes):
+                route_nodes = []
+                for j in range(int(request.form.get(f'num_nodes_route_{i}', 2))):
+                    node = request.form.get(f'route_{i}_node_{j}')
+                    if node and node not in route_nodes:
+                        route_nodes.append(node)
+                if len(set(route_nodes)) == len(route_nodes) and len(route_nodes) >= 2:
+                    routes.append(route_nodes)
+                else:
+                    error = f"Route {i} contains duplicate nodes or too few nodes!"
+                    break
+            if not error and routes:
+                optimizer = TransitOptimizer(graph, routes)
+                schedule = optimizer.optimize_schedule(transit_datetime, num_trips_per_route=num_trips,
+                                                       trip_interval=trip_interval)
+                allocation = optimizer.allocate_resources(total_vehicles=total_vehicles)
+                map_path = os.path.join(STATIC_DIR, 'transit_map.html')
+                visualize_transit(graph, routes, schedule, map_path)
+                baseline = []
+                for r_idx, route in enumerate(routes):
+                    baseline.extend([(r_idx, transit_datetime + timedelta(minutes=i * 30)) for i in range(num_trips)])
+                transit_analysis = analyze_improvements(graph, routes, baseline, schedule, output_dir=STATIC_DIR)
+                travel_times = []
+                for route_idx, route in enumerate(routes):
+                    route_time = sum(calculate_travel_time(graph, route[i], route[i + 1], transit_datetime)
+                                     for i in range(len(route) - 1))
+                    travel_times.append({
+                        "Route Index": route_idx,
+                        "Route": " -> ".join(route),
+                        "Travel Time (min)": round(route_time, 2)
+                    })
+                transit_results = {
+                    'schedule': [(r, t.isoformat()) for r, t in schedule],
+                    'allocation': allocation,
+                    'analysis': transit_analysis,
+                    'routes': routes,
+                    'travel_times': travel_times
+                }
+                save_json(transit_results, TRANSIT_FILE)
+                transit_summary = {
+                    'baseline_avg_time': transit_analysis['baseline_average_travel_time_minutes'],
+                    'optimized_avg_time': transit_analysis['optimized_average_travel_time_minutes'],
+                    'time_improvement': transit_analysis['time_improvement_percent'],
+                    'transfer_efficiency': transit_analysis['transfer_efficiency_percent']
+                }
+                allocation_df = pd.DataFrame(list(allocation.items()), columns=["Route Index", "Vehicles Allocated"]).to_dict('records')
+                schedule_df = pd.DataFrame(
+                    [(r, datetime.fromisoformat(t).strftime('%Y-%m-%d %H:%M')) for r, t in transit_results['schedule']],
+                    columns=["Route Index", "Time"]
+                ).to_dict('records')
+                travel_times_df = pd.DataFrame(travel_times).to_dict('records')
+                map_file = 'transit_map.html'
+
+        return render_template('main.html', app_mode=app_mode, nodes=nodes, transit_summary=transit_summary,
+                               allocation_df=allocation_df, schedule_df=schedule_df,
+                               travel_times_df=travel_times_df, map_file=map_file, error=error, config=config)
+
+    return render_template('main.html', app_mode=app_mode, nodes=nodes, config=config)
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    file_path = os.path.join(DATA_DIR, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    return "File not found", 404
+
+@app.route('/static/<path:path>')
+def serve_static(path):
+    return send_from_directory(STATIC_DIR, path)
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
