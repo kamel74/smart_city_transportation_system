@@ -16,4 +16,4 @@ Flask app for Cairo's traffic & transit management using NetworkX. Models city g
 ## Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/cairo-traffic-transit.git
+   git clone https://github.com/kamel74/cairo-traffic-transit.git
